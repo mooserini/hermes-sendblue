@@ -86,8 +86,10 @@ SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media 
 # Companion cadence: multi-bubble text replies with typing + thought pauses.
 DEFAULT_CHUNKED_REPLIES = True
 DEFAULT_CHUNK_MAX = 4
-DEFAULT_CHUNK_DELAY_MIN_MS = 1100
-DEFAULT_CHUNK_DELAY_MAX_MS = 2800
+# Inter-bubble thought pauses. Keep long enough for the iMessage ”…” to paint
+# and read as human-adjacent — short floors look eager / bot-fast.
+DEFAULT_CHUNK_DELAY_MIN_MS = 1800
+DEFAULT_CHUNK_DELAY_MAX_MS = 4200
 DEFAULT_CHUNK_TYPING = True
 # Don't bother multi-bubbling tiny one-liners (still allow explicit \n\n splits).
 CHUNK_MIN_TEXT_CHARS = 72
@@ -1354,14 +1356,17 @@ class SendblueAdapter(BasePlatformAdapter):
                     # reply): show the iMessage ”…” so it feels like a thought
                     # still forming — especially after a voice note lands first.
                     if index == 0:
-                        # Short lead-in before bubble 1 (post-voice / post-think).
-                        pause = _chunk_pause_seconds(700, 1400)
+                        # Lead-in before bubble 1 (post-voice / post-think).
+                        # Slightly shorter than inter-beat pauses, still long
+                        # enough for ”…” to fully paint after a voice note.
+                        pause = _chunk_pause_seconds(1400, 2600)
                     else:
                         pause = _chunk_pause_seconds(
                             self.settings.chunk_delay_min_ms,
                             self.settings.chunk_delay_max_ms,
                         )
-                    pause = max(pause, 0.85)
+                    # Floor: sub-second gaps never look intentional on iMessage.
+                    pause = max(pause, 1.4)
                     pause_ms = int(pause * 1000)
                     if self.settings.chunk_typing:
                         try:
