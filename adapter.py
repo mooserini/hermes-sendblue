@@ -1347,26 +1347,35 @@ class SendblueAdapter(BasePlatformAdapter):
 
         message_ids: List[str] = []
         try:
+            multi = len(beats) > 1
             for index, beat in enumerate(beats):
-                if index > 0:
-                    # Thought-pause between bubbles: hold the iMessage ”…” for
-                    # the full delay so it reads as "still typing", not a flash.
-                    pause = _chunk_pause_seconds(
-                        self.settings.chunk_delay_min_ms,
-                        self.settings.chunk_delay_max_ms,
-                    )
-                    # Floor the pause a bit so typing is human-visible even when
-                    # min_ms is set very low.
-                    pause = max(pause, 0.65)
+                if index > 0 or (multi and index == 0 and self.settings.chunk_typing):
+                    # Between beats (and before the first beat of a multi-bubble
+                    # reply): show the iMessage ”…” so it feels like a thought
+                    # still forming — especially after a voice note lands first.
+                    if index == 0:
+                        # Short lead-in before bubble 1 (post-voice / post-think).
+                        pause = _chunk_pause_seconds(700, 1400)
+                    else:
+                        pause = _chunk_pause_seconds(
+                            self.settings.chunk_delay_min_ms,
+                            self.settings.chunk_delay_max_ms,
+                        )
+                    pause = max(pause, 0.85)
                     pause_ms = int(pause * 1000)
                     if self.settings.chunk_typing:
                         try:
                             await self.client.send_typing_indicator(
                                 target,
                                 state="start",
-                                # Slight buffer so the indicator doesn't drop
-                                # in the last milliseconds before send.
-                                max_duration_ms=pause_ms + 600,
+                                max_duration_ms=pause_ms + 800,
+                            )
+                            logger.info(
+                                "Sendblue typing… for %dms before beat %d/%d to %s",
+                                pause_ms,
+                                index + 1,
+                                len(beats),
+                                _redacted_phone(target),
                             )
                         except Exception as typing_exc:
                             logger.warning(
@@ -1374,11 +1383,35 @@ class SendblueAdapter(BasePlatformAdapter):
                                 _redacted_phone(target),
                                 typing_exc,
                             )
-                    await asyncio.sleep(pause)
+                        # Re-ping halfway so the ”…” doesn't die on slow iMessage
+                        # delivery or get eaten by a just-sent bubble/voice note.
+                        half = pause / 2.0
+                        if half > 0.4:
+                            await asyncio.sleep(half)
+                            try:
+                                await self.client.send_typing_indicator(
+                                    target,
+                                    state="start",
+                                    max_duration_ms=int(half * 1000) + 500,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Sendblue mid-pause typing refresh failed",
+                                    exc_info=True,
+                                )
+                            await asyncio.sleep(pause - half)
+                        else:
+                            await asyncio.sleep(pause)
+                    else:
+                        await asyncio.sleep(pause)
+                    # index==0 multi path already did its lead-in pause above;
+                    # continue into send. index>0 also done.
+                    if index == 0 and multi:
+                        pass  # fall through to send first beat
                 message_ids.append(await self.client.send_message(target, beat))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
-            if len(beats) > 1:
+            if multi:
                 logger.info(
                     "Sendblue sent %d chat beats to %s (typing=%s)",
                     len(beats),
