@@ -12,14 +12,17 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import error, parse, request
 
 from gateway.config import Platform
@@ -247,8 +250,116 @@ def _is_local_media(value: Any) -> bool:
     return bool(text) and not text.startswith(("http://", "https://"))
 
 
+def _normalize_upload_filename(filename: str) -> str:
+    """Return a multipart-safe upload name with a lowercased extension.
+
+    Hermes historically matched ``MEDIA:`` tags with a case-sensitive extension
+    regex (fixed on newer cores, still worth defending). Sendblue also uses the
+    upload filename as a type hint. Keep the stem intact — including spaces —
+    but force the extension to lowercase so ``Photo.JPG`` / ``Audio Message.CAF``
+    upload as deliverable names.
+    """
+    raw = str(filename or "").strip() or "file"
+    name = Path(raw).name.replace("\r", "").replace("\n", "").replace('"', "")
+    if not name or name in {".", ".."}:
+        name = "file"
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        stem = "file"
+    return f"{stem}{ext.lower()}"
+
+
+def _transcode_caf_to_m4a(source: Path) -> Optional[Path]:
+    """Best-effort convert Apple CAF voice notes to AAC/M4A for delivery.
+
+    Returns a path inside a fresh temp directory on success, or ``None`` when
+    ffmpeg is missing or conversion fails (caller uploads the original CAF).
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-media-"))
+    dest = tmp_dir / f"{source.stem or 'audio'}.m4a"
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                str(dest),
+            ],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0 or not dest.is_file() or dest.stat().st_size <= 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+        return dest
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+
+def _prepare_local_media_for_upload(file_path: str | Path) -> Tuple[Path, str, Optional[Path]]:
+    """Normalize a local media path before Sendblue upload.
+
+    Returns ``(path_to_read, upload_filename, cleanup_path)``.
+    ``cleanup_path`` is a temp directory the caller must remove after upload
+    (used when CAF audio is transcoded to M4A).
+    """
+    path = Path(file_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Local media path not found: {file_path}")
+
+    read_path = path
+    upload_name = _normalize_upload_filename(path.name)
+    cleanup: Optional[Path] = None
+
+    if path.suffix.lower() == ".caf":
+        converted = _transcode_caf_to_m4a(path)
+        if converted is not None:
+            read_path = converted
+            upload_name = _normalize_upload_filename(converted.name)
+            cleanup = converted.parent
+            logger.info(
+                "Transcoded CAF %s -> %s for Sendblue upload",
+                path.name,
+                upload_name,
+            )
+        else:
+            logger.debug(
+                "CAF transcode unavailable; uploading original %s as %s",
+                path.name,
+                upload_name,
+            )
+
+    return read_path, upload_name, cleanup
+
+
+def _cleanup_prepared_media(cleanup: Optional[Path]) -> None:
+    if cleanup is None:
+        return
+    try:
+        if cleanup.is_dir():
+            shutil.rmtree(cleanup, ignore_errors=True)
+        elif cleanup.is_file():
+            cleanup.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Failed to clean temp media %s", cleanup, exc_info=True)
+
+
 def _build_multipart(filename: str, data: bytes, boundary: str) -> bytes:
-    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    safe_name = _normalize_upload_filename(filename).replace('"', "").replace("\r", "").replace("\n", "")
     header = (
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
@@ -505,6 +616,7 @@ class SendblueClient:
             raise RuntimeError(f"Sendblue API connection error: {exc}") from exc
 
     async def upload_file_from_bytes(self, filename: str, data: bytes) -> str:
+        filename = _normalize_upload_filename(filename)
         if not data:
             raise ValueError(f"File '{filename}' is empty")
         if len(data) > SENDBLUE_MAX_UPLOAD_BYTES:
@@ -527,11 +639,12 @@ class SendblueClient:
         return str(media_url)
 
     async def upload_file(self, file_path: str) -> str:
-        path = Path(file_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Local media path not found: {file_path}")
-        data = await asyncio.to_thread(path.read_bytes)
-        return await self.upload_file_from_bytes(path.name, data)
+        read_path, upload_name, cleanup = _prepare_local_media_for_upload(file_path)
+        try:
+            data = await asyncio.to_thread(read_path.read_bytes)
+            return await self.upload_file_from_bytes(upload_name, data)
+        finally:
+            _cleanup_prepared_media(cleanup)
 
     def _download_media_sync(
         self, media_url: str, *, authenticated: bool = False
@@ -873,7 +986,9 @@ class SendblueAdapter(BasePlatformAdapter):
             # plain [Media: <url>] marker so the message is never lost.
             try:
                 data, content_type = await self.client.download_media(media_url)
-                filename = parse.unquote(os.path.basename(parse.urlparse(media_url).path))
+                filename = _normalize_upload_filename(
+                    parse.unquote(os.path.basename(parse.urlparse(media_url).path))
+                )
                 cached = _classify_and_cache(data, filename, content_type)
                 if cached is None:
                     raise RuntimeError(

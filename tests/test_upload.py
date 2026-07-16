@@ -115,6 +115,74 @@ class IsLocalMediaTests(unittest.TestCase):
         self.assertFalse(adapter._is_local_media(None))
 
 
+class NormalizeUploadFilenameTests(unittest.TestCase):
+    def test_lowercases_extension(self) -> None:
+        self.assertEqual(adapter._normalize_upload_filename("Photo.JPG"), "Photo.jpg")
+        self.assertEqual(adapter._normalize_upload_filename("doc.PDF"), "doc.pdf")
+        self.assertEqual(adapter._normalize_upload_filename("Audio Message.CAF"), "Audio Message.caf")
+
+    def test_preserves_already_lowercase_extension(self) -> None:
+        self.assertEqual(adapter._normalize_upload_filename("shot.png"), "shot.png")
+
+    def test_strips_directory_components(self) -> None:
+        self.assertEqual(
+            adapter._normalize_upload_filename("/tmp/out/My Photo.PNG"),
+            "My Photo.png",
+        )
+
+    def test_empty_falls_back_to_file(self) -> None:
+        self.assertEqual(adapter._normalize_upload_filename(""), "file")
+
+    def test_strips_quotes_and_newlines(self) -> None:
+        self.assertEqual(
+            adapter._normalize_upload_filename('weird"\nname.JPG'),
+            "weirdname.jpg",
+        )
+
+
+class PrepareLocalMediaTests(unittest.TestCase):
+    def test_uppercase_extension_keeps_source_path_and_lowercases_name(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "Holiday.JPG"
+            src.write_bytes(b"fake-jpeg-bytes")
+            read_path, upload_name, cleanup = adapter._prepare_local_media_for_upload(src)
+            self.assertEqual(read_path, src)
+            self.assertEqual(upload_name, "Holiday.jpg")
+            self.assertIsNone(cleanup)
+
+    def test_missing_file_raises(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            adapter._prepare_local_media_for_upload("/no/such/file.JPG")
+
+    def test_upload_file_uses_lowercased_multipart_filename(self) -> None:
+        import tempfile
+
+        client = adapter.SendblueClient(
+            adapter.SendblueSettings(
+                api_key="k",
+                api_secret="s",
+                phone_number="+15550000000",
+            )
+        )
+        captured: dict = {}
+
+        def fake_post(path, headers, body, *, timeout=60.0):
+            captured["body"] = body
+            return {"status": "OK", "media_url": "https://cdn.sendblue.test/up"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "Scan.PDF"
+            src.write_bytes(b"%PDF-1.4")
+            with patch.object(client, "_raw_post_sync", side_effect=fake_post):
+                url = asyncio.run(client.upload_file(str(src)))
+
+        self.assertEqual(url, "https://cdn.sendblue.test/up")
+        self.assertIn(b'filename="Scan.pdf"', captured["body"])
+        self.assertNotIn(b'filename="Scan.PDF"', captured["body"])
+
+
 class BuildMultipartTests(unittest.TestCase):
     def test_includes_boundary_header_and_footer(self) -> None:
         body = adapter._build_multipart("hello.png", b"\x89PNGdata", "BOUND123")
