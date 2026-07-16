@@ -289,8 +289,13 @@ def _normalize_upload_filename(filename: str) -> str:
     return f"{stem}{ext.lower()}"
 
 
-def _run_ffmpeg_to_m4a(source: Path, dest: Path) -> bool:
-    """Transcode *source* audio to AAC/M4A at *dest*. Returns True on success."""
+def _run_ffmpeg(
+    source: Path,
+    dest: Path,
+    *,
+    audio_args: List[str],
+) -> bool:
+    """Run ffmpeg with the given audio codec args. Returns True on success."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return False
@@ -304,10 +309,7 @@ def _run_ffmpeg_to_m4a(source: Path, dest: Path) -> bool:
                 "error",
                 "-i",
                 str(source),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
+                *audio_args,
                 str(dest),
             ],
             capture_output=True,
@@ -319,15 +321,38 @@ def _run_ffmpeg_to_m4a(source: Path, dest: Path) -> bool:
         return False
 
 
-def _transcode_caf_to_m4a(source: Path) -> Optional[Path]:
-    """Best-effort convert Apple CAF voice notes to AAC/M4A (file path).
+def _run_ffmpeg_to_m4a(source: Path, dest: Path) -> bool:
+    """Transcode *source* audio to AAC/M4A at *dest*. Returns True on success."""
+    return _run_ffmpeg(
+        source,
+        dest,
+        audio_args=["-c:a", "aac", "-b:a", "128k"],
+    )
 
-    Returns a path inside a fresh temp directory on success, or ``None`` when
-    ffmpeg is missing or conversion fails (caller uploads the original CAF).
+
+def _run_ffmpeg_to_caf(source: Path, dest: Path) -> bool:
+    """Transcode *source* audio to Apple CAF (PCM) at *dest*.
+
+    Sendblue renders ``.caf`` ``media_url`` values as native iMessage voice
+    notes (inline bubble). Linear PCM in a CAF container is widely accepted.
     """
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-media-"))
-    dest = tmp_dir / f"{source.stem or 'audio'}.m4a"
-    if not _run_ffmpeg_to_m4a(source, dest):
+    return _run_ffmpeg(
+        source,
+        dest,
+        # Mono 24 kHz PCM keeps voice notes compact while remaining iMessage-friendly.
+        audio_args=["-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1"],
+    )
+
+
+def _transcode_to_caf(source: Path) -> Optional[Path]:
+    """Best-effort convert audio to Apple CAF for native iMessage voice notes.
+
+    Returns a path inside a fresh temp directory on success, or ``None``.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-voice-"))
+    # Sendblue's docs use this style of object name for voice notes.
+    dest = tmp_dir / "Audio Message.caf"
+    if not _run_ffmpeg_to_caf(source, dest):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
     return dest
@@ -355,12 +380,19 @@ def _transcode_caf_bytes_to_m4a(data: bytes) -> Optional[Tuple[bytes, str]]:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _prepare_local_media_for_upload(file_path: str | Path) -> Tuple[Path, str, Optional[Path]]:
+def _prepare_local_media_for_upload(
+    file_path: str | Path,
+    *,
+    as_voice_note: bool = False,
+) -> Tuple[Path, str, Optional[Path]]:
     """Normalize a local media path before Sendblue upload.
 
     Returns ``(path_to_read, upload_filename, cleanup_path)``.
-    ``cleanup_path`` is a temp directory the caller must remove after upload
-    (used when CAF audio is transcoded to M4A).
+    ``cleanup_path`` is a temp directory the caller must remove after upload.
+
+    When ``as_voice_note`` is True (Hermes ``send_voice`` / auto-TTS path),
+    non-CAF audio is best-effort transcoded to Apple CAF so Sendblue delivers
+    a native iMessage voice bubble rather than a generic file attachment.
     """
     path = Path(file_path).expanduser()
     if not path.is_file():
@@ -370,23 +402,26 @@ def _prepare_local_media_for_upload(file_path: str | Path) -> Tuple[Path, str, O
     upload_name = _normalize_upload_filename(path.name)
     cleanup: Optional[Path] = None
 
-    if path.suffix.lower() == ".caf":
-        converted = _transcode_caf_to_m4a(path)
-        if converted is not None:
-            read_path = converted
-            upload_name = _normalize_upload_filename(converted.name)
-            cleanup = converted.parent
-            logger.info(
-                "Transcoded CAF %s -> %s for Sendblue upload",
-                path.name,
-                upload_name,
-            )
+    if as_voice_note:
+        if path.suffix.lower() == ".caf":
+            # Already CAF — keep bytes, use a voice-note-friendly upload name.
+            upload_name = "Audio Message.caf"
         else:
-            logger.debug(
-                "CAF transcode unavailable; uploading original %s as %s",
-                path.name,
-                upload_name,
-            )
+            converted = _transcode_to_caf(path)
+            if converted is not None:
+                read_path = converted
+                upload_name = "Audio Message.caf"
+                cleanup = converted.parent
+                logger.info(
+                    "Transcoded %s -> Audio Message.caf for native iMessage voice note",
+                    path.name,
+                )
+            else:
+                logger.warning(
+                    "Voice-note CAF encode failed for %s; uploading as attachment (%s)",
+                    path.name,
+                    upload_name,
+                )
 
     return read_path, upload_name, cleanup
 
@@ -683,8 +718,10 @@ class SendblueClient:
             raise RuntimeError(f"Sendblue upload returned no media_url: {payload}")
         return str(media_url)
 
-    async def upload_file(self, file_path: str) -> str:
-        read_path, upload_name, cleanup = _prepare_local_media_for_upload(file_path)
+    async def upload_file(self, file_path: str, *, as_voice_note: bool = False) -> str:
+        read_path, upload_name, cleanup = _prepare_local_media_for_upload(
+            file_path, as_voice_note=as_voice_note
+        )
         try:
             data = await asyncio.to_thread(read_path.read_bytes)
             return await self.upload_file_from_bytes(upload_name, data)
@@ -1135,8 +1172,14 @@ class SendblueAdapter(BasePlatformAdapter):
         chat_id: str,
         media: str,
         caption: Optional[str] = None,
+        *,
+        as_voice_note: bool = False,
     ) -> SendResult:
-        """Upload a local file (or pass through a URL) and send it as a Sendblue attachment."""
+        """Upload a local file (or pass through a URL) and send it via Sendblue.
+
+        When ``as_voice_note`` is True, local audio is converted to ``.caf`` so
+        iMessage renders a native voice-note bubble (Sendblue docs).
+        """
         target = _normalize_phone(chat_id)
         if not target:
             return SendResult(success=False, error="Missing destination phone number")
@@ -1146,16 +1189,36 @@ class SendblueAdapter(BasePlatformAdapter):
         media_url = media
         if _is_local_media(media):
             try:
-                media_url = await self.client.upload_file(media)
-                logger.info("Sendblue uploaded local file %s -> %s", media, media_url)
+                media_url = await self.client.upload_file(
+                    media, as_voice_note=as_voice_note
+                )
+                logger.info(
+                    "Sendblue uploaded local file %s -> %s (voice_note=%s)",
+                    media,
+                    media_url,
+                    as_voice_note,
+                )
             except (FileNotFoundError, ValueError) as exc:
                 return SendResult(success=False, error=str(exc), retryable=False)
             except Exception as exc:
                 return SendResult(success=False, error=str(exc), retryable=True)
 
         try:
+            # Voice notes are media-only; a text caption would force a separate
+            # bubble and can prevent the native voice UI on some clients.
+            body_text = "" if as_voice_note else self.format_message(caption or "")
+            if as_voice_note and caption:
+                # Send the voice note first, then caption text if present.
+                message_id = await self.client.send_message(
+                    target, "", media_url=media_url
+                )
+                cap = self.format_message(caption)
+                if cap:
+                    await self.client.send_message(target, cap)
+                return SendResult(success=True, message_id=message_id)
+
             message_id = await self.client.send_message(
-                target, self.format_message(caption or ""), media_url=media_url
+                target, body_text, media_url=media_url
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
@@ -1219,7 +1282,10 @@ class SendblueAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         del reply_to, metadata, kwargs
-        return await self._attach_local_or_remote(chat_id, audio_path, caption)
+        # Force CAF so iMessage shows a native voice-note bubble, not a file.
+        return await self._attach_local_or_remote(
+            chat_id, audio_path, caption, as_voice_note=True
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         phone = _normalize_phone(chat_id)

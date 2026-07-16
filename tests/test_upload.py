@@ -157,6 +157,45 @@ class InboundCafTranscodeTests(unittest.TestCase):
         self.assertIn(b"ftyp", data[:32])
 
 
+class OutboundVoiceNoteTests(unittest.TestCase):
+    def test_voice_note_transcodes_mp3_to_caf_when_ffmpeg_available(self) -> None:
+        if not adapter.shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not installed")
+        samples = sorted(
+            (Path.home() / ".hermes" / "audio_cache").glob("tts_*.mp3"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not samples:
+            self.skipTest("no local TTS mp3 sample")
+        read_path, upload_name, cleanup = adapter._prepare_local_media_for_upload(
+            samples[0], as_voice_note=True
+        )
+        try:
+            self.assertEqual(upload_name, "Audio Message.caf")
+            self.assertTrue(str(read_path).endswith(".caf"))
+            self.assertTrue(read_path.is_file())
+            self.assertGreater(read_path.stat().st_size, 100)
+            # CoreAudio Format magic
+            header = read_path.read_bytes()[:4]
+            self.assertEqual(header, b"caff")
+        finally:
+            adapter._cleanup_prepared_media(cleanup)
+
+    def test_non_voice_upload_does_not_force_caf(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "clip.mp3"
+            src.write_bytes(b"not-real-mp3")
+            read_path, upload_name, cleanup = adapter._prepare_local_media_for_upload(
+                src, as_voice_note=False
+            )
+            self.assertEqual(read_path, src)
+            self.assertEqual(upload_name, "clip.mp3")
+            self.assertIsNone(cleanup)
+
+
 class PrepareLocalMediaTests(unittest.TestCase):
     def test_uppercase_extension_keeps_source_path_and_lowercases_name(self) -> None:
         import tempfile
