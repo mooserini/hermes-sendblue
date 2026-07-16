@@ -56,3 +56,23 @@ optional_env:
     description: "Secret expected in Sendblue's sb-signing-secret header."
     prompt: "Webhook secret"
     password: true
+  - name: SENDBLUE_CHUNKED_REPLIES
+    description: "Split long replies into multiple iMessage bubbles with typing pauses (companion cadence). Default: true."
+    prompt: "Chunked multi-bubble replies? (true/false)"
+    password: false
+  - name: SENDBLUE_CHUNK_MAX
+    description: "Max bubbles per reply when chunking. Default: 4."
+    prompt: "Max chat beats per reply"
+    password: false
+  - name: SENDBLUE_CHUNK_DELAY_MIN_MS
+    description: "Min thought-pause between bubbles in ms. Default: 900."
+    prompt: "Min inter-bubble delay (ms)"
+    password: false
+  - name: SENDBLUE_CHUNK_DELAY_MAX_MS
+    description: "Max thought-pause between bubbles in ms. Default: 2400."
+    prompt: "Max inter-bubble delay (ms)"
+    password: false
+  - name: SENDBLUE_CHUNK_TYPING
+    description: "Send a typing indicator before each bubble after the first. Default: true."
+    prompt: "Typing between bubbles? (true/false)"
+    password: false

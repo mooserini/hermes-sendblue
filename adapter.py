@@ -12,6 +12,8 @@ import hmac
 import json
 import logging
 import os
+import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -80,6 +82,16 @@ MIN_WEBHOOK_SECRET_CHARS = 16
 SENDBLUE_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # Sendblue documented per-file limit
 SENDBLUE_MEDIA_DOWNLOAD_TIMEOUT = 30.0  # seconds; matches base.py URL-cache helpers
 SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media download
+
+# Companion cadence: multi-bubble text replies with typing + thought pauses.
+DEFAULT_CHUNKED_REPLIES = True
+DEFAULT_CHUNK_MAX = 4
+DEFAULT_CHUNK_DELAY_MIN_MS = 900
+DEFAULT_CHUNK_DELAY_MAX_MS = 2400
+DEFAULT_CHUNK_TYPING = True
+# Don't bother multi-bubbling tiny one-liners (still allow explicit \n\n splits).
+CHUNK_MIN_TEXT_CHARS = 72
+CHUNK_MIN_BEAT_CHARS = 10
 
 # Sendblue inbound messages carry no media-type metadata (only a bare media_url),
 # so we download the bytes and let _classify_and_cache() classify them, then map the
@@ -244,6 +256,97 @@ def _split_message(text: str, limit: int = MAX_SENDBLUE_BODY_CHARS) -> List[str]
         remaining = remaining[split_at:].lstrip()
 
     return [chunk for chunk in chunks if chunk]
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split prose into sentence-ish beats, keeping terminal punctuation."""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    # Prefer hard sentence ends; also treat em/en dash pauses as soft boundaries
+    # when the model writes run-on companion prose.
+    parts = re.split(r"(?<=[.!?…])\s+|(?<=[.!?…])(?=[\"'”’])\s*", text)
+    sentences = [p.strip() for p in parts if p and p.strip()]
+    if len(sentences) <= 1:
+        return [text]
+
+    # Fold tiny fragments into the previous beat (e.g. "lol." "ok.")
+    merged: List[str] = []
+    for s in sentences:
+        if merged and len(s) < CHUNK_MIN_BEAT_CHARS:
+            merged[-1] = f"{merged[-1]} {s}".strip()
+        else:
+            merged.append(s)
+    return merged or [text]
+
+
+def _split_chat_beats(text: str, *, max_beats: int = DEFAULT_CHUNK_MAX) -> List[str]:
+    """Post-split a full reply into short iMessage-style texting beats.
+
+    Prefer explicit paragraph breaks (``\\n\\n``). Otherwise sentence-split.
+    Cap at ``max_beats`` so a long essay doesn't become a firehose.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return []
+
+    max_beats = max(1, min(int(max_beats or DEFAULT_CHUNK_MAX), 8))
+
+    # Explicit multi-paragraph authoring always wins.
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+
+    if len(paragraphs) <= 1:
+        single = paragraphs[0] if paragraphs else text
+        # Short one-liners stay one bubble — no fake multi-send for "ok cool".
+        if len(single) < CHUNK_MIN_TEXT_CHARS and "\n" not in single:
+            return _split_message(single)
+        # Single-newline soft breaks: treat as weak paragraph hints.
+        if "\n" in single and "\n\n" not in text:
+            line_parts = [ln.strip() for ln in single.split("\n") if ln.strip()]
+            if 2 <= len(line_parts) <= max_beats:
+                paragraphs = line_parts
+            else:
+                paragraphs = _split_sentences(single)
+        else:
+            paragraphs = _split_sentences(single)
+
+    if len(paragraphs) == 1:
+        return _split_message(paragraphs[0])
+
+    # Cap: keep the first (max_beats - 1) beats, fold remainder into the last.
+    if len(paragraphs) > max_beats:
+        head = paragraphs[: max_beats - 1]
+        tail = " ".join(paragraphs[max_beats - 1 :]).strip()
+        paragraphs = head + ([tail] if tail else [])
+
+    # Absorb near-empty orphans into the previous bubble.
+    beats: List[str] = []
+    for part in paragraphs:
+        if beats and len(part) < CHUNK_MIN_BEAT_CHARS:
+            beats[-1] = f"{beats[-1]} {part}".strip()
+        else:
+            beats.append(part)
+
+    # Hard length safety per bubble (Sendblue body limit).
+    out: List[str] = []
+    for beat in beats:
+        out.extend(_split_message(beat))
+
+    if len(out) > max_beats:
+        head = out[: max_beats - 1]
+        tail = "\n\n".join(out[max_beats - 1 :]).strip()
+        out = head + ([tail] if tail else [])
+
+    return out or _split_message(text)
+
+
+def _chunk_pause_seconds(min_ms: int, max_ms: int) -> float:
+    """Random thought-pause between bubbles (seconds)."""
+    lo = max(0, int(min_ms))
+    hi = max(lo, int(max_ms))
+    if hi <= 0:
+        return 0.0
+    return random.uniform(lo / 1000.0, hi / 1000.0)
 
 
 def _parse_datetime(value: Any) -> datetime:
@@ -473,6 +576,12 @@ class SendblueSettings:
     webhook_port: int = 3141
     webhook_path: str = "/webhook/sendblue"
     webhook_secret: str = ""
+    # Companion cadence — multi-bubble post-split with typing + thought pauses
+    chunked_replies: bool = DEFAULT_CHUNKED_REPLIES
+    chunk_max: int = DEFAULT_CHUNK_MAX
+    chunk_delay_min_ms: int = DEFAULT_CHUNK_DELAY_MIN_MS
+    chunk_delay_max_ms: int = DEFAULT_CHUNK_DELAY_MAX_MS
+    chunk_typing: bool = DEFAULT_CHUNK_TYPING
 
 
 def _settings_from_config(config: Any) -> SendblueSettings:
@@ -503,6 +612,38 @@ def _settings_from_config(config: Any) -> SendblueSettings:
     lookback = os.getenv("SENDBLUE_STARTUP_LOOKBACK_SECONDS") or extra.get("startup_lookback_seconds")
     limit = os.getenv("SENDBLUE_MESSAGE_LIMIT") or extra.get("message_limit")
     webhook = extra.get("webhook", {}) if isinstance(extra.get("webhook"), dict) else {}
+
+    # Chunked replies: default ON for companion cadence. Explicit false disables.
+    chunked_raw = os.getenv("SENDBLUE_CHUNKED_REPLIES")
+    if chunked_raw is None and "chunked_replies" not in extra:
+        chunked_replies = DEFAULT_CHUNKED_REPLIES
+    else:
+        chunked_replies = _is_truthy(
+            chunked_raw if chunked_raw is not None else extra.get("chunked_replies")
+        )
+
+    chunk_max = int(
+        os.getenv("SENDBLUE_CHUNK_MAX")
+        or extra.get("chunk_max")
+        or DEFAULT_CHUNK_MAX
+    )
+    chunk_delay_min_ms = int(
+        os.getenv("SENDBLUE_CHUNK_DELAY_MIN_MS")
+        or extra.get("chunk_delay_min_ms")
+        or DEFAULT_CHUNK_DELAY_MIN_MS
+    )
+    chunk_delay_max_ms = int(
+        os.getenv("SENDBLUE_CHUNK_DELAY_MAX_MS")
+        or extra.get("chunk_delay_max_ms")
+        or DEFAULT_CHUNK_DELAY_MAX_MS
+    )
+    chunk_typing_raw = os.getenv("SENDBLUE_CHUNK_TYPING")
+    if chunk_typing_raw is None and "chunk_typing" not in extra:
+        chunk_typing = DEFAULT_CHUNK_TYPING
+    else:
+        chunk_typing = _is_truthy(
+            chunk_typing_raw if chunk_typing_raw is not None else extra.get("chunk_typing")
+        )
 
     return SendblueSettings(
         api_key=str(api_key).strip(),
@@ -542,6 +683,11 @@ def _settings_from_config(config: Any) -> SendblueSettings:
             or extra.get("webhook_secret")
             or ""
         ),
+        chunked_replies=chunked_replies,
+        chunk_max=max(1, min(chunk_max, 8)),
+        chunk_delay_min_ms=max(0, chunk_delay_min_ms),
+        chunk_delay_max_ms=max(0, chunk_delay_max_ms),
+        chunk_typing=chunk_typing,
     )
 
 
@@ -1150,12 +1296,44 @@ class SendblueAdapter(BasePlatformAdapter):
         if not target:
             return SendResult(success=False, error="Missing destination phone number")
 
+        text = self.format_message(content)
+        if not text:
+            return SendResult(success=False, error="Empty message")
+
+        # Companion cadence: multi-bubble post-split + typing/thought pauses.
+        # Falls back to length-only splits when chunked_replies is off.
+        if self.settings.chunked_replies:
+            beats = _split_chat_beats(text, max_beats=self.settings.chunk_max)
+        else:
+            beats = _split_message(text)
+
         message_ids: List[str] = []
         try:
-            for chunk in _split_message(self.format_message(content)):
-                message_ids.append(await self.client.send_message(target, chunk))
+            for index, beat in enumerate(beats):
+                if index > 0:
+                    if self.settings.chunk_typing:
+                        try:
+                            await self.client.send_typing_indicator(target)
+                        except Exception:
+                            logger.debug(
+                                "Sendblue inter-bubble typing failed",
+                                exc_info=True,
+                            )
+                    pause = _chunk_pause_seconds(
+                        self.settings.chunk_delay_min_ms,
+                        self.settings.chunk_delay_max_ms,
+                    )
+                    if pause > 0:
+                        await asyncio.sleep(pause)
+                message_ids.append(await self.client.send_message(target, beat))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
+            if len(beats) > 1:
+                logger.info(
+                    "Sendblue sent %d chat beats to %s",
+                    len(beats),
+                    _redacted_phone(target),
+                )
             return SendResult(success=True, message_id=",".join(message_ids))
         except Exception as exc:
             return SendResult(success=False, error=str(exc), retryable=True)

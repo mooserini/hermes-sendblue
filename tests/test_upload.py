@@ -157,6 +157,41 @@ class InboundCafTranscodeTests(unittest.TestCase):
         self.assertIn(b"ftyp", data[:32])
 
 
+class SplitChatBeatsTests(unittest.TestCase):
+    def test_short_one_liner_stays_single_bubble(self) -> None:
+        beats = adapter._split_chat_beats("ok cool")
+        self.assertEqual(beats, ["ok cool"])
+
+    def test_paragraph_breaks_become_bubbles(self) -> None:
+        text = "lmfao a glitter render of poking the air with sticks 💀\n\nthats going straight on the tombstone wall tom\n\nhermes standing at the cloudflare dashboard aggressively poking with a sparkly stick is the energy this whole night deserves"
+        beats = adapter._split_chat_beats(text, max_beats=4)
+        self.assertEqual(len(beats), 3)
+        self.assertIn("glitter render", beats[0])
+        self.assertIn("tombstone", beats[1])
+        self.assertIn("cloudflare", beats[2])
+
+    def test_sentence_split_when_no_paragraphs(self) -> None:
+        text = (
+            "lmfao a glitter render of poking the air with sticks. "
+            "thats going straight on the tombstone wall tom. "
+            "hermes standing at the cloudflare dashboard is the energy this whole night deserves."
+        )
+        beats = adapter._split_chat_beats(text, max_beats=4)
+        self.assertGreaterEqual(len(beats), 2)
+        self.assertLessEqual(len(beats), 4)
+
+    def test_respects_max_beats(self) -> None:
+        text = "\n\n".join([f"beat number {i} with enough words to keep" for i in range(8)])
+        beats = adapter._split_chat_beats(text, max_beats=3)
+        self.assertEqual(len(beats), 3)
+        self.assertIn("beat number 0", beats[0])
+        self.assertIn("beat number 7", beats[-1])
+
+    def test_empty_is_empty(self) -> None:
+        self.assertEqual(adapter._split_chat_beats(""), [])
+        self.assertEqual(adapter._split_chat_beats("   "), [])
+
+
 class OutboundVoiceNoteTests(unittest.TestCase):
     def test_voice_note_transcodes_mp3_to_caf_when_ffmpeg_available(self) -> None:
         if not adapter.shutil.which("ffmpeg"):
