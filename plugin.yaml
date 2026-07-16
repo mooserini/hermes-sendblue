@@ -65,11 +65,11 @@ optional_env:
     prompt: "Max chat beats per reply"
     password: false
   - name: SENDBLUE_CHUNK_DELAY_MIN_MS
-    description: "Min thought-pause between bubbles in ms. Default: 900."
+    description: "Min thought-pause between bubbles in ms. Default: 1100."
     prompt: "Min inter-bubble delay (ms)"
     password: false
   - name: SENDBLUE_CHUNK_DELAY_MAX_MS
-    description: "Max thought-pause between bubbles in ms. Default: 2400."
+    description: "Max thought-pause between bubbles in ms. Default: 2800."
     prompt: "Max inter-bubble delay (ms)"
     password: false
   - name: SENDBLUE_CHUNK_TYPING

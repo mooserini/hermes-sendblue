@@ -86,8 +86,8 @@ SENDBLUE_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024  # bound each inbound media 
 # Companion cadence: multi-bubble text replies with typing + thought pauses.
 DEFAULT_CHUNKED_REPLIES = True
 DEFAULT_CHUNK_MAX = 4
-DEFAULT_CHUNK_DELAY_MIN_MS = 900
-DEFAULT_CHUNK_DELAY_MAX_MS = 2400
+DEFAULT_CHUNK_DELAY_MIN_MS = 1100
+DEFAULT_CHUNK_DELAY_MAX_MS = 2800
 DEFAULT_CHUNK_TYPING = True
 # Don't bother multi-bubbling tiny one-liners (still allow explicit \n\n splits).
 CHUNK_MIN_TEXT_CHARS = 72
@@ -797,17 +797,55 @@ class SendblueClient:
         )
         return str(payload.get("message_handle") or payload.get("id") or int(time.time() * 1000))
 
-    async def send_typing_indicator(self, to_number: str) -> None:
-        body = {
-            "number": _normalize_phone(to_number),
+    async def send_typing_indicator(
+        self,
+        to_number: str,
+        *,
+        state: str = "start",
+        max_duration_ms: Optional[int] = None,
+    ) -> None:
+        """Show (or stop) the iMessage ”…” bubble for *to_number*.
+
+        Sendblue typing-v2 accepts ``state`` (``start``/``stop``) and
+        ``max_duration_ms`` so the indicator can cover an entire thought-pause
+        between multi-bubble replies. Older worker firmware may reject the
+        extended fields — we fall back to a bare start request in that case.
+        """
+        number = _normalize_phone(to_number)
+        body: Dict[str, Any] = {
+            "number": number,
             "from_number": self.settings.phone_number,
+            "state": state if state in {"start", "stop"} else "start",
         }
-        await asyncio.to_thread(
-            self._json_request_sync,
-            "POST",
-            "/api/send-typing-indicator",
-            body=body,
-        )
+        if max_duration_ms is not None and body["state"] == "start":
+            # API range: 1 .. 300000 ms
+            body["max_duration_ms"] = max(1, min(int(max_duration_ms), 300_000))
+
+        try:
+            await asyncio.to_thread(
+                self._json_request_sync,
+                "POST",
+                "/api/send-typing-indicator",
+                body=body,
+            )
+        except Exception as first_exc:
+            # Legacy workers: strip typing-v2 fields and retry once.
+            if "max_duration_ms" in body or body.get("state") != "start":
+                legacy = {
+                    "number": number,
+                    "from_number": self.settings.phone_number,
+                }
+                try:
+                    await asyncio.to_thread(
+                        self._json_request_sync,
+                        "POST",
+                        "/api/send-typing-indicator",
+                        body=legacy,
+                    )
+                    return
+                except Exception:
+                    pass
+            raise first_exc
 
     async def mark_read(self, to_number: str) -> None:
         body = {
@@ -1311,28 +1349,41 @@ class SendblueAdapter(BasePlatformAdapter):
         try:
             for index, beat in enumerate(beats):
                 if index > 0:
-                    if self.settings.chunk_typing:
-                        try:
-                            await self.client.send_typing_indicator(target)
-                        except Exception:
-                            logger.debug(
-                                "Sendblue inter-bubble typing failed",
-                                exc_info=True,
-                            )
+                    # Thought-pause between bubbles: hold the iMessage ”…” for
+                    # the full delay so it reads as "still typing", not a flash.
                     pause = _chunk_pause_seconds(
                         self.settings.chunk_delay_min_ms,
                         self.settings.chunk_delay_max_ms,
                     )
-                    if pause > 0:
-                        await asyncio.sleep(pause)
+                    # Floor the pause a bit so typing is human-visible even when
+                    # min_ms is set very low.
+                    pause = max(pause, 0.65)
+                    pause_ms = int(pause * 1000)
+                    if self.settings.chunk_typing:
+                        try:
+                            await self.client.send_typing_indicator(
+                                target,
+                                state="start",
+                                # Slight buffer so the indicator doesn't drop
+                                # in the last milliseconds before send.
+                                max_duration_ms=pause_ms + 600,
+                            )
+                        except Exception as typing_exc:
+                            logger.warning(
+                                "Sendblue inter-bubble typing failed for %s: %s",
+                                _redacted_phone(target),
+                                typing_exc,
+                            )
+                    await asyncio.sleep(pause)
                 message_ids.append(await self.client.send_message(target, beat))
             if not message_ids:
                 return SendResult(success=False, error="Empty message")
             if len(beats) > 1:
                 logger.info(
-                    "Sendblue sent %d chat beats to %s",
+                    "Sendblue sent %d chat beats to %s (typing=%s)",
                     len(beats),
                     _redacted_phone(target),
+                    self.settings.chunk_typing,
                 )
             return SendResult(success=True, message_id=",".join(message_ids))
         except Exception as exc:
