@@ -545,6 +545,12 @@ class SendblueClient:
         parsed = parse.urlparse(media_url)
         if parsed.scheme != "https" or not parsed.netloc:
             raise RuntimeError(f"Refusing non-HTTPS media URL: {media_url}")
+        # Sendblue may return an object name containing spaces (for example,
+        # "Audio Message.caf"). urllib rejects raw control/space characters,
+        # so preserve an already-escaped path while encoding the unsafe pieces.
+        media_url = parse.urlunparse(
+            parsed._replace(path=parse.quote(parsed.path, safe="/%"))
+        )
 
         # The download targets the CDN host, not api.sendblue.com, so by default we
         # do NOT send sb-api-key credentials (avoid leaking them to the CDN). Flip
@@ -725,7 +731,11 @@ class SendblueAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Sendblue"
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Hermes gateway v0.18+ passes this keyword on both first connect and
+        # reconnect attempts. The adapter does not need distinct behavior yet,
+        # but it must honor BasePlatformAdapter's current contract.
+        del is_reconnect
         missing = []
         if not self.settings.api_key:
             missing.append("SENDBLUE_API_KEY")
