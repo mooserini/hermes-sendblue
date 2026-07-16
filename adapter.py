@@ -131,6 +131,10 @@ def _classify_and_cache(data: bytes, filename: str, mime: str) -> Optional[tuple
     cache_*_from_bytes helpers. Returns None when the bytes can't be classified
     (the caller then falls back to the ``[Media: <url>]`` marker). ``kind`` is one
     of "image" / "audio" / "video" / "document".
+
+    Apple iMessage voice notes arrive from Sendblue as CAF. Hermes STT does not
+    accept ``.caf``, so inbound CAF is best-effort transcoded to M4A before
+    caching whenever ffmpeg is available.
     """
     mime = (mime or "").lower()
     ext = os.path.splitext(filename or "")[1].lower()
@@ -142,7 +146,23 @@ def _classify_and_cache(data: bytes, filename: str, mime: str) -> Optional[tuple
             except ValueError:
                 return None  # claimed to be an image but the bytes aren't one
         if mime.startswith("audio/") or ext in _AUDIO_EXTS:
-            chosen = ext if ext in _AUDIO_EXTS else _AUDIO_EXT_BY_MIME.get(mime, ".ogg")
+            is_caf = ext == ".caf" or "caf" in mime
+            if is_caf:
+                converted = _transcode_caf_bytes_to_m4a(data)
+                if converted is not None:
+                    data, chosen = converted
+                    mime = "audio/mp4"
+                    logger.info(
+                        "Transcoded inbound CAF voice note to M4A for STT (%d bytes)",
+                        len(data),
+                    )
+                else:
+                    chosen = ".caf"
+                    logger.warning(
+                        "Inbound CAF could not be transcoded; STT may reject .caf"
+                    )
+            else:
+                chosen = ext if ext in _AUDIO_EXTS else _AUDIO_EXT_BY_MIME.get(mime, ".ogg")
             return cache_audio_from_bytes(data, chosen), mime or "audio/mpeg", "audio"
         if mime.startswith("video/") or ext in _VIDEO_EXTS:
             chosen = ext if ext in _VIDEO_EXTS else _VIDEO_EXT_BY_MIME.get(mime, ".mp4")
@@ -269,18 +289,11 @@ def _normalize_upload_filename(filename: str) -> str:
     return f"{stem}{ext.lower()}"
 
 
-def _transcode_caf_to_m4a(source: Path) -> Optional[Path]:
-    """Best-effort convert Apple CAF voice notes to AAC/M4A for delivery.
-
-    Returns a path inside a fresh temp directory on success, or ``None`` when
-    ffmpeg is missing or conversion fails (caller uploads the original CAF).
-    """
+def _run_ffmpeg_to_m4a(source: Path, dest: Path) -> bool:
+    """Transcode *source* audio to AAC/M4A at *dest*. Returns True on success."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return None
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-media-"))
-    dest = tmp_dir / f"{source.stem or 'audio'}.m4a"
+        return False
     try:
         result = subprocess.run(
             [
@@ -301,13 +314,45 @@ def _transcode_caf_to_m4a(source: Path) -> Optional[Path]:
             timeout=120,
             check=False,
         )
-        if result.returncode != 0 or not dest.is_file() or dest.stat().st_size <= 0:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return None
-        return dest
+        return result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
     except Exception:
+        return False
+
+
+def _transcode_caf_to_m4a(source: Path) -> Optional[Path]:
+    """Best-effort convert Apple CAF voice notes to AAC/M4A (file path).
+
+    Returns a path inside a fresh temp directory on success, or ``None`` when
+    ffmpeg is missing or conversion fails (caller uploads the original CAF).
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-media-"))
+    dest = tmp_dir / f"{source.stem or 'audio'}.m4a"
+    if not _run_ffmpeg_to_m4a(source, dest):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
+    return dest
+
+
+def _transcode_caf_bytes_to_m4a(data: bytes) -> Optional[Tuple[bytes, str]]:
+    """Best-effort convert inbound CAF bytes to M4A for Hermes STT.
+
+    Hermes transcription accepts ``.m4a`` but not ``.caf``. Returns
+    ``(m4a_bytes, ".m4a")`` on success, or ``None`` to keep the original CAF.
+    """
+    if not data:
+        return None
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sendblue-caf-in-"))
+    try:
+        source = tmp_dir / "input.caf"
+        dest = tmp_dir / "output.m4a"
+        source.write_bytes(data)
+        if not _run_ffmpeg_to_m4a(source, dest):
+            return None
+        return dest.read_bytes(), ".m4a"
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _prepare_local_media_for_upload(file_path: str | Path) -> Tuple[Path, str, Optional[Path]]:

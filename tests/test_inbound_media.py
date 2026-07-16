@@ -101,12 +101,24 @@ class InboundMediaTests(unittest.TestCase):
         self.assertEqual(ev[0].media_types, ["image/png"])
 
     def test_caf_voice_becomes_voice(self):
+        # Prefer a real CAF sample when one exists (ffmpeg path); otherwise fall
+        # back to raw bytes which still classify as VOICE without STT.
+        sample = Path.home() / ".hermes" / "audio_cache" / "audio_fe1ea53f3c45.caf"
+        if sample.is_file() and sample.stat().st_size > 0:
+            caf_bytes = sample.read_bytes()
+        else:
+            caf_bytes = b"caf-bytes-not-validated"
+
         ev = self._run(
-            self._downloader(b"caf-bytes-not-validated", "audio/x-caf"),
+            self._downloader(caf_bytes, "audio/x-caf"),
             media_url="https://cdn.sendblue.test/voice.caf",
         )
         self.assertEqual(ev[0].message_type, adapter.MessageType.VOICE)
-        self.assertEqual(ev[0].media_types, ["audio/x-caf"])
+        # When ffmpeg can transcode, inbound CAF is cached as M4A for STT.
+        if ev[0].media_types == ["audio/mp4"]:
+            self.assertTrue(ev[0].media_urls[0].endswith(".m4a"))
+        else:
+            self.assertEqual(ev[0].media_types, ["audio/x-caf"])
 
     def test_mp4_becomes_video(self):
         ev = self._run(

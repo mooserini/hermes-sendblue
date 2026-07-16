@@ -140,6 +140,23 @@ class NormalizeUploadFilenameTests(unittest.TestCase):
         )
 
 
+class InboundCafTranscodeTests(unittest.TestCase):
+    def test_real_caf_bytes_become_m4a_when_ffmpeg_available(self) -> None:
+        if not adapter.shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not installed")
+        sample = Path.home() / ".hermes" / "audio_cache" / "audio_fe1ea53f3c45.caf"
+        if not sample.is_file():
+            self.skipTest("no local CAF sample in audio_cache")
+        out = adapter._transcode_caf_bytes_to_m4a(sample.read_bytes())
+        self.assertIsNotNone(out)
+        assert out is not None
+        data, ext = out
+        self.assertEqual(ext, ".m4a")
+        self.assertGreater(len(data), 100)
+        # ISO BMFF / M4A magic is typically at offset 4: 'ftyp'
+        self.assertIn(b"ftyp", data[:32])
+
+
 class PrepareLocalMediaTests(unittest.TestCase):
     def test_uppercase_extension_keeps_source_path_and_lowercases_name(self) -> None:
         import tempfile
