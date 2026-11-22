@@ -4,6 +4,8 @@ Text your [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) over iMess
 
 This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes platform plugin that lives under `~/.hermes/plugins/sendblue` and plugs into `hermes gateway`.
 
+The adapter has two layers. `SendblueClient` in `adapter.py` handles the Sendblue HTTP API. The Hermes gateway adapter handles polling or webhook events, sender permissions, media caches and cron delivery. Another host can use the same HTTP endpoints, receive-webhook payloads and environment-variable conventions. To run the adapter itself, it needs the Hermes gateway interfaces imported by this module.
+
 ## What It Supports
 
 - Inbound messages through Sendblue polling or optional webhooks
@@ -13,7 +15,9 @@ This is the Hermes Agent version of `openclaw-sendblue`: a third-party Hermes pl
 - De-duplication with a small SQLite store under `~/.hermes/platforms/sendblue`
 - Cron/notification delivery with `deliver=sendblue` and `SENDBLUE_HOME_CHANNEL`
 - Public CDN-style image URL delivery as Sendblue media attachments
-- Local file attachments uploaded automatically via Sendblue's `/api/upload-file` (max 100 MB)
+- Local file attachments uploaded automatically via Sendblue's `/api/upload-file` (adapter limit 100 MiB)
+- Inbound media downloads up to 25 MiB per file, with local caching in Hermes
+- Voice-note conversion with optional ffmpeg and configurable multi-bubble text replies
 
 ## Quick Start
 
@@ -50,7 +54,7 @@ If `hermes --help` says "IBC Relayer" or "Informal Systems", your shell is findi
 
 ### 3. Install This Plugin
 
-From this repo:
+To run this checkout, keep it in a permanent location and run
 
 ```bash
 ./install.sh
@@ -62,23 +66,23 @@ That symlinks the repo to `$HERMES_HOME/plugins/sendblue`, defaulting to:
 ~/.hermes/plugins/sendblue
 ```
 
-For a real-file install rather than a symlink, run the one-shot from this checkout:
+For a real-file install of **current upstream**, run the one-shot installer. It fetches the default branch at execution time, even when invoked from a pinned checkout.
 
 ```bash
 SENDBLUE_INSTALLER_RESTART=0 ./install-sendblue-one-shot.sh
 ```
 
-It fetches the public default branch, copies it into the selected `HERMES_HOME`,
-and verifies that Hermes lists `sendblue-platform` as enabled. Set `HERMES_BIN`
-to the exact CLI executable if you have several installations. Restart is disabled
-in the example so you can configure credentials and the allowed sender first.
+Set `HERMES_HOME` to the target profile and `HERMES_BIN` to the intended Hermes executable when you have multiple installations. The installer moves an existing plugin into the profile's `backups/` directory and saves a copy of an existing `.env` before merging. It preserves existing assignments (including empty ones) and adds a missing final newline before appending keys. If the caller supplies an allowlist and omits the home channel, the installer uses the first allowed number for a missing home-channel assignment.
+
+The installer verifies that `hermes plugins list --enabled --user --json` reports `sendblue-platform` as enabled before restarting. If verification fails, it exits with the installed files in place. Restart mode `0` skips restart, `auto` restarts when the three credential and line assignments in `.env` are nonempty, and `1` requests restart even with incomplete credentials.
 
 ### 4. Enable and Configure
 
-Third-party Hermes plugins are opt-in. Enable this one once:
+After a symlink install, enable the plugin and check the listing. The one-shot installer already does both.
 
 ```bash
 hermes plugins enable sendblue-platform
+hermes plugins list --enabled --user --json
 ```
 
 The easiest path is Hermes' setup wizard:
@@ -205,20 +209,25 @@ Common fixes:
 - In webhook mode, confirm your public URL forwards to the configured local port
 - If another Hermes profile is using the same Sendblue line, stop that gateway first
 
-## Known Issues
+### A caption arrives without its attachment
 
-### Files with uppercase extensions can't be sent
+The adapter lowercases the extension in the upload filename. A local `Photo.JPG` can be uploaded without renaming the original. First check whether Hermes extracted the path from the reply and handed it to the adapter. A lowercase copy can help isolate a case-sensitive extractor on an older Hermes installation. If the upload was attempted, check that the gateway can read the file, that it fits the 100 MiB upload limit and that Sendblue returned a media URL.
 
-If you try to attach a file with an uppercase extension like `.JPG`, `.PNG`, `.PDF`, or `.MP4`, the message will be delivered with the caption text but **no attachment**. There is no error — the agent just appears to "forget" the file.
+### A voice note arrives as a file
 
-**Workaround:** rename or copy the file to use a lowercase extension before sending.
+The adapter classifies inbound audio as voice. With ffmpeg on the gateway's PATH, it attempts to convert incoming CAF to M4A for Hermes speech-to-text, and outgoing local voice audio to CAF for native iMessage playback. Failed conversion preserves the original audio format. Check the gateway log for a conversion warning. Incoming media that cannot be downloaded or classified falls back to a link.
 
-```bash
-cp MyPhoto.JPG myphoto.jpg
-# then send myphoto.jpg
-```
+## Reply timing
 
-**Why:** This is an upstream bug in hermes-agent itself, not this plugin. Its `extract_media` regex in `gateway/platforms/base.py` is compiled without `re.IGNORECASE`, so paths with uppercase extensions never match. 
+Interactive text replies use plain text and can split on paragraphs or sentences. Short one-liners usually stay in one bubble. Standalone cron delivery uses length-only splitting.
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `SENDBLUE_CHUNKED_REPLIES` | `true` | Enables conversational splitting. Set to `false` for length-only splitting. |
+| `SENDBLUE_CHUNK_MAX` | `4` | Target maximum conversational beats, clamped to 1–8. Each beat is split again as needed to fit the 18,000-character message limit. |
+| `SENDBLUE_CHUNK_DELAY_MIN_MS` | `1800` | Minimum configured pause between bubbles. The send loop applies a 1.4-second floor. |
+| `SENDBLUE_CHUNK_DELAY_MAX_MS` | `4200` | Maximum configured inter-bubble pause. |
+| `SENDBLUE_CHUNK_TYPING` | `true` | Requests typing indicators for multi-bubble replies when the route supports them. |
 
 ## Development
 
@@ -229,7 +238,7 @@ python3 -m compileall .
 python3 -m unittest discover -s tests
 ```
 
-The plugin intentionally uses only the Python standard library plus Hermes' gateway APIs.
+The adapter uses Python 3.11 or later and Hermes gateway APIs. Core messaging uses the Python standard library. Voice-note conversion uses the optional ffmpeg executable. The inbound-media tests need a real Hermes core, and two conversion tests also need ffmpeg and audio fixtures.
 
 ## Research Notes
 

@@ -187,6 +187,16 @@ class SplitChatBeatsTests(unittest.TestCase):
         self.assertIn("beat number 0", beats[0])
         self.assertIn("beat number 7", beats[-1])
 
+    def test_transport_limit_takes_precedence_over_beat_cap(self) -> None:
+        limit = adapter.MAX_SENDBLUE_BODY_CHARS
+        paragraphs = [letter * limit for letter in "abcde"]
+        text = "\n\n".join(paragraphs)
+        for max_beats in (1, 4):
+            with self.subTest(max_beats=max_beats):
+                messages = adapter._split_chat_beats(text, max_beats=max_beats)
+                self.assertEqual([len(message) for message in messages], [limit] * 5)
+                self.assertEqual(messages, paragraphs)
+
     def test_empty_is_empty(self) -> None:
         self.assertEqual(adapter._split_chat_beats(""), [])
         self.assertEqual(adapter._split_chat_beats("   "), [])

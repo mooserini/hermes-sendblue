@@ -61,7 +61,7 @@ optional_env:
     prompt: "Chunked multi-bubble replies? (true/false)"
     password: false
   - name: SENDBLUE_CHUNK_MAX
-    description: "Max bubbles per reply when chunking. Default: 4."
+    description: "Target maximum conversational beats per reply (1-8). A long beat may need multiple messages. Default: 4."
     prompt: "Max chat beats per reply"
     password: false
   - name: SENDBLUE_CHUNK_DELAY_MIN_MS

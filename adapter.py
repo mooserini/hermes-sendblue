@@ -286,7 +286,8 @@ def _split_chat_beats(text: str, *, max_beats: int = DEFAULT_CHUNK_MAX) -> List[
     """Post-split a full reply into short iMessage-style texting beats.
 
     Prefer explicit paragraph breaks (``\\n\\n``). Otherwise sentence-split.
-    Cap at ``max_beats`` so a long essay doesn't become a firehose.
+    Aim for at most ``max_beats`` conversational beats. Each beat may need
+    multiple messages to fit the transport limit.
     """
     text = str(text or "").strip()
     if not text:
@@ -334,12 +335,7 @@ def _split_chat_beats(text: str, *, max_beats: int = DEFAULT_CHUNK_MAX) -> List[
     for beat in beats:
         out.extend(_split_message(beat))
 
-    if len(out) > max_beats:
-        head = out[: max_beats - 1]
-        tail = "\n\n".join(out[max_beats - 1 :]).strip()
-        out = head + ([tail] if tail else [])
-
-    return out or _split_message(text)
+    return out
 
 
 def _chunk_pause_seconds(min_ms: int, max_ms: int) -> float:
