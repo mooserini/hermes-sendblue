@@ -83,3 +83,24 @@ esac''')
         result, calls = self.install()
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertLess(calls.index('plugins list'), calls.index('gateway restart'))
+
+    def test_home_channel_defaults_to_first_allowed_user_only(self):
+        result, calls = self.install(
+            SENDBLUE_INSTALLER_RESTART='0',
+            SENDBLUE_ALLOWED_USERS='+15550001,+15550002')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        env_text = (self.root / 'data' / '.env').read_text()
+        self.assertIn('SENDBLUE_ALLOWED_USERS=+15550001,+15550002\n', env_text)
+        self.assertIn('SENDBLUE_HOME_CHANNEL=+15550001\n', env_text)
+        self.assertNotIn('SENDBLUE_HOME_CHANNEL=+15550001,+15550002', env_text)
+
+    def test_env_append_keeps_existing_last_line_intact(self):
+        data = self.root / 'data'
+        data.mkdir(parents=True)
+        (data / '.env').write_text('EXISTING=1')  # no trailing newline
+        result, calls = self.install(SENDBLUE_INSTALLER_RESTART='0',
+                                     SENDBLUE_API_KEY='test-key')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        env_text = (data / '.env').read_text()
+        self.assertIn('EXISTING=1\n', env_text)
+        self.assertIn('\nSENDBLUE_API_KEY=test-key\n', env_text)
