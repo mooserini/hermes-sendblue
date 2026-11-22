@@ -165,11 +165,21 @@ merge_key() {
   fi
 }
 
+# If the existing .env does not end in a newline, the first append would
+# glue onto its last line — ensure a separator before merging anything.
+if [ -s "$ENV_FILE" ] && [ -n "$(tail -c 1 "$ENV_FILE")" ]; then
+  printf '\n' >> "$ENV_FILE"
+  say "Added the missing trailing newline to .env before appending."
+fi
+
 merge_key SENDBLUE_API_KEY       "${SENDBLUE_API_KEY:-}"
 merge_key SENDBLUE_API_SECRET    "${SENDBLUE_API_SECRET:-}"
 merge_key SENDBLUE_PHONE_NUMBER  "${SENDBLUE_PHONE_NUMBER:-}"
 merge_key SENDBLUE_ALLOWED_USERS "${SENDBLUE_ALLOWED_USERS:-}"
-merge_key SENDBLUE_HOME_CHANNEL  "${SENDBLUE_HOME_CHANNEL:-${SENDBLUE_ALLOWED_USERS:-}}"
+# Home channel is ONE phone number: default it to the FIRST allowlist
+# entry only, never the whole comma-joined list.
+FIRST_ALLOWED="$(printf '%s' "${SENDBLUE_ALLOWED_USERS:-}" | cut -d, -f1)"
+merge_key SENDBLUE_HOME_CHANNEL  "${SENDBLUE_HOME_CHANNEL:-$FIRST_ALLOWED}"
 # Poll mode is the default and needs no public endpoint. Make it explicit
 # only if the caller asked for a different interval.
 if [ -n "${SENDBLUE_POLL_INTERVAL_SECONDS:-}" ]; then
