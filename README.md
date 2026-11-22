@@ -62,6 +62,17 @@ That symlinks the repo to `$HERMES_HOME/plugins/sendblue`, defaulting to:
 ~/.hermes/plugins/sendblue
 ```
 
+For a real-file install rather than a symlink, run the one-shot from this checkout:
+
+```bash
+SENDBLUE_INSTALLER_RESTART=0 ./install-sendblue-one-shot.sh
+```
+
+It fetches the public default branch, copies it into the selected `HERMES_HOME`,
+and verifies that Hermes lists `sendblue-platform` as enabled. Set `HERMES_BIN`
+to the exact CLI executable if you have several installations. Restart is disabled
+in the example so you can configure credentials and the allowed sender first.
+
 ### 4. Enable and Configure
 
 Third-party Hermes plugins are opt-in. Enable this one once:
