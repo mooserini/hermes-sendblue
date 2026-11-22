@@ -42,6 +42,10 @@ You need:
 - Your Sendblue phone number
 - The personal phone number you will text from
 
+**Agent-assisted phone setup.** For a new account, start with `sendblue setup --phone <number> --no-wait`. For an existing account, use `sendblue login --phone <number> --no-wait`. Show the operator the destination and exact verification phrase printed by the CLI. After they text it from their phone, run the corresponding `sendblue setup --check` or `sendblue login --check` with the same CLI state. Exit code 3 means verification is pending. Keep credential output local.
+
+For a separate Sendblue cloud sandbox, `sendblue sandbox init --no-wait` starts verification without an upfront phone number or API key. Resume with `sendblue setup --check`, then run `sendblue sandbox create` after verification succeeds. The Hermes gateway can run on your existing host without provisioning a Sendblue sandbox. [Sendblue's agent onboarding guide](https://docs.sendblue.com/llms.txt)
+
 ### 2. Install Hermes Agent
 
 ```bash
@@ -239,6 +243,17 @@ python3 -m unittest discover -s tests
 ```
 
 The adapter uses Python 3.11 or later and Hermes gateway APIs. Core messaging uses the Python standard library. Voice-note conversion uses the optional ffmpeg executable. The inbound-media tests need a real Hermes core, and two conversion tests also need ffmpeg and audio fixtures.
+
+## Using Sendblue from another agent via MCP
+
+The Hermes gateway receives inbound messages and routes replies to the conversation. An MCP client can also call Sendblue on demand. Choose the integration that fits the client:
+
+| Connection | Authentication | Tool scope |
+| --- | --- | --- |
+| [Sendblue-hosted MCP](https://github.com/sendblue-api/sendblue-grok-plugin) at `https://api.sendblue.co/mcp` | Streamable HTTP with OAuth. The operator chooses a workspace and grants read or send permission. | Check connectivity, list sending lines, read recent messages, send a text, check delivery status, and summarize messaging health. |
+| [Local MCP package](https://docs.sendblue.com/mcp) launched with `npx -y sendblue-api-mcp` | The MCP process reads `SENDBLUE_API_API_KEY` and `SENDBLUE_API_API_SECRET`. | Includes messages, contacts, groups, and media uploads. Use `--operation=read` for reads or `--resource=messages` to select message tools. |
+
+Hermes accepts those two MCP credential names as aliases for `SENDBLUE_API_KEY` and `SENDBLUE_API_SECRET`. Its gateway setup and installer use the shorter names. Each integration manages its own access: Hermes sender allowlists apply to incoming gateway conversations, and the hosted MCP uses its workspace's OAuth permissions.
 
 ## Research Notes
 
